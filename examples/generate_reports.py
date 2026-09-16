@@ -31,25 +31,34 @@ def load_results_from_dir(results_dir: str):
     Load evaluation results from a harness output directory.
 
     Accepts either a run directory containing ``<strategy>_results.json``
-    files, or the base results directory (picks the run named by
-    ``latest.json``). Strategies are keyed by the ``strategy`` field of
-    the records.
+    files, or the base results directory. For a base directory, the run
+    named by ``latest.json`` wins; otherwise the newest ``run-*``
+    subdirectory is used. Top-level ``<strategy>_results.json`` files
+    (legacy pre-timestamped layout) are consulted only when no run
+    subdirectory exists. Strategies are keyed by the ``strategy`` field
+    of the records.
 
     Returns:
         (results, run_dir) where run_dir is the resolved run directory.
     """
     dir_path = Path(results_dir)
+
+    latest_file = dir_path / "latest.json"
+    if latest_file.exists():
+        with open(latest_file, "r", encoding="utf-8") as f:
+            latest = json.load(f).get("latest_run")
+        if latest:
+            run_path = dir_path / latest
+            if sorted(run_path.glob("*_results.json")):
+                return _load_strategy_files(run_path), run_path
+
+    run_dirs = sorted(dir_path.glob("run-*"))
+    if run_dirs:
+        run_path = run_dirs[-1]
+        if sorted(run_path.glob("*_results.json")):
+            return _load_strategy_files(run_path), run_path
+
     files = sorted(dir_path.glob("*_results.json"))
-
-    if not files:
-        latest_file = dir_path / "latest.json"
-        if latest_file.exists():
-            with open(latest_file, "r", encoding="utf-8") as f:
-                latest = json.load(f).get("latest_run")
-            if latest:
-                dir_path = dir_path / latest
-                files = sorted(dir_path.glob("*_results.json"))
-
     if not files:
         raise FileNotFoundError(
             f"No *_results.json files found in {dir_path}. "
@@ -70,14 +79,49 @@ def load_results_from_dir(results_dir: str):
     return results, dir_path
 
 
-def load_model_name(config_path: str = "config.json") -> str:
-    """Read the model name from config.json (never touches the API key)."""
+def _load_strategy_files(run_path: Path):
+    """Load <strategy>_results.json files from a run directory."""
+    results: Dict[str, List[ExecutionResult]] = {}
+    for path in sorted(run_path.glob("*_results.json")):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for result_data in data:
+            strategy = result_data.get("strategy", path.stem.replace("_results", ""))
+            results.setdefault(strategy, []).append(ExecutionResult(**result_data))
+    return results
+
+
+def load_run_config(run_dir: Path, config_path: str = "config.json") -> Dict:
+    """
+    Build the display config for report headers.
+
+    Prefers the run's own metadata.json (records the model/temperature/
+    timeout actually used); falls back to config.json in the working
+    directory for legacy runs without metadata.
+    """
+    meta_file = Path(run_dir) / "metadata.json" if run_dir else None
+    if meta_file and meta_file.exists():
+        with open(meta_file, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        llm = meta.get("llm", {})
+        cfg = meta.get("config", {}).get("llm_config", {})
+        return {
+            "model": llm.get("model") or cfg.get("model", "unknown"),
+            "temperature": cfg.get("temperature", 0.7),
+            "timeout": cfg.get("timeout", 300),
+        }
+
     path = Path(config_path)
     if not path.exists():
-        return "unknown"
+        return {"model": "unknown", "temperature": 0.7, "timeout": 300}
     with open(path, "r", encoding="utf-8") as f:
         config = json.load(f)
-    return config.get("llm_config", {}).get("model", "unknown")
+    llm_config = config.get("llm_config", {})
+    return {
+        "model": llm_config.get("model", "unknown"),
+        "temperature": llm_config.get("temperature", 0.7),
+        "timeout": llm_config.get("timeout", 300),
+    }
 
 
 def calculate_metrics(results: Dict[str, List[ExecutionResult]]) -> Dict[str, Dict]:
@@ -185,11 +229,7 @@ def main():
         results=results,
         output_path=str(html_path),
         include_charts=True,
-        config={
-            'model': load_model_name(),
-            'temperature': 0.7,
-            'timeout': 300
-        }
+        config=load_run_config(run_dir)
     )
     print(f"        ✓ Saved to {html_path}")
 
